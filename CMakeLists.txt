@@ -323,6 +323,7 @@ IF(ENABLE_OPENCL)
     LIST(APPEND RESOURCES
       src/opencl_depth_packet_processor.cl
       src/opencl_kde_depth_packet_processor.cl
+      src/opencl_depth_shadow_removal.cl
     )
 
     # Major Linux distro stable releases have buggy OpenCL ICD loader.

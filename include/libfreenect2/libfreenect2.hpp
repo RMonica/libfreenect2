@@ -119,6 +119,7 @@ public:
 
     bool EnableBilateralFilter; ///< Remove some "flying pixels".
     bool EnableEdgeAwareFilter; ///< Remove pixels on edges because ToF cameras produce noisy edges.
+    bool EnableIrShadowFilter;  ///< Remove IR shadows
 
     /** Default is 0.5, 4.5, true, true */
     LIBFREENECT2_API Config();

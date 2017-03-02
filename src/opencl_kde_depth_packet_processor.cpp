@@ -183,6 +183,8 @@ public:
   cl::Kernel kernel_filterPixelStage1;
   cl::Kernel kernel_processPixelStage2_phase;
   cl::Kernel kernel_filter_kde;
+  cl::Kernel kernel_prepareIrShadowDiscard;
+  cl::Kernel kernel_applyIrShadowDiscard;
 
   // Read only buffers
   size_t buf_lut11to16_size;
@@ -209,6 +211,8 @@ public:
   size_t buf_depth_size;
   size_t buf_ir_sum_size;
   size_t buf_phase_conf_size;
+  size_t buf_shadow_discarded_size;
+  size_t buf_shadow_discarded_flag_size;
 
   cl::Buffer buf_a;
   cl::Buffer buf_b;
@@ -227,6 +231,8 @@ public:
   cl::Buffer buf_phase_3;
   cl::Buffer buf_gaussian_kernel;
   cl::Buffer buf_phase_conf;
+  cl::Buffer buf_ir_shadow_discarded;
+  cl::Buffer buf_ir_shadow_left;
 
   bool deviceInitialized;
   bool programBuilt;
@@ -350,6 +356,12 @@ public:
     oss << " -D UNWRAPPING_LIKELIHOOD_SCALE="<<params.unwrapping_likelihood_scale<<"f";
     oss << " -D PHASE_CONFIDENCE_SCALE="<<params.phase_confidence_scale<<"f";
     oss << " -D KDE_THRESHOLD="<<params.kde_threshold<<"f";
+
+    oss << " -D FOCAL_LENGTH=" << 365.0 << "f";
+    oss << " -D SHADOW_FILTER_ERODE_RIGHT=" << 1 << "u";
+    oss << " -D SHADOW_FILTER_ERODE_LEFT=" << 1 << "u";
+    oss << " -D IR_EMITTER_DISTANCE=" << 0.08 * 1000.0 << "f";
+    oss << " -D SHADOW_FILTER_MAX_VISUAL_ANGLE=" << cos(2.0 / 180.0 * M_PI) << "f";
 
     oss << " -cl-mad-enable -cl-no-signed-zeros -cl-fast-relaxed-math";
     options = oss.str();
@@ -503,6 +515,8 @@ public:
     buf_depth_size = IMAGE_SIZE * sizeof(cl_float);
     buf_ir_sum_size = IMAGE_SIZE * sizeof(cl_float);
     buf_phase_conf_size = IMAGE_SIZE * sizeof(cl_float4);
+    buf_shadow_discarded_size = IMAGE_SIZE * sizeof(cl_float);
+    buf_shadow_discarded_flag_size = IMAGE_SIZE * sizeof(cl_uchar);
 
     CHECK_CL_PARAM(buf_a = cl::Buffer(context, CL_MEM_READ_WRITE, buf_a_size, NULL, &err));
     CHECK_CL_PARAM(buf_b = cl::Buffer(context, CL_MEM_READ_WRITE, buf_b_size, NULL, &err));
@@ -523,6 +537,9 @@ public:
       CHECK_CL_PARAM(buf_phase_3 = cl::Buffer(context, CL_MEM_READ_WRITE, buf_depth_size, NULL, &err));
       CHECK_CL_PARAM(buf_conf_3 = cl::Buffer(context, CL_MEM_READ_WRITE, buf_depth_size, NULL, &err));
     }
+
+    CHECK_CL_PARAM(buf_ir_shadow_discarded = cl::Buffer(context, CL_READ_WRITE_CACHE, buf_shadow_discarded_size, NULL, &err));
+    CHECK_CL_PARAM(buf_ir_shadow_left = cl::Buffer(context, CL_READ_WRITE_CACHE, buf_shadow_discarded_flag_size, NULL, &err));
 
     return true;
   }
@@ -595,14 +612,25 @@ public:
       CHECK_CL_RETURN(kernel_filter_kde.setArg(4, buf_depth));
     }
 
+    CHECK_CL_PARAM(kernel_prepareIrShadowDiscard = cl::Kernel(program, "prepareShadowFilter", &err));
+    CHECK_CL_RETURN(kernel_prepareIrShadowDiscard.setArg(0, buf_depth));
+    CHECK_CL_RETURN(kernel_prepareIrShadowDiscard.setArg(1, buf_ir_shadow_left));
+
+    CHECK_CL_PARAM(kernel_applyIrShadowDiscard = cl::Kernel(program, "applyShadowFilter", &err));
+    CHECK_CL_RETURN(kernel_applyIrShadowDiscard.setArg(0, buf_depth));
+    CHECK_CL_RETURN(kernel_applyIrShadowDiscard.setArg(1, buf_ir_shadow_left));
+    CHECK_CL_RETURN(kernel_applyIrShadowDiscard.setArg(2, buf_ir_shadow_discarded));
+
     programInitialized = true;
     return true;
   }
 
   bool run(const DepthPacket &packet)
   {
-    std::vector<cl::Event> eventWrite(1), eventPPS1(1), eventFPS1(1), eventPPS2(1), eventFPS2(1);
+    std::vector<cl::Event> eventWrite(1), eventPPS1(1), eventFPS1(1), eventPPS2(1), eventFPS2(1), eventPrepShadow(1), eventApplyShadow(1);
     cl::Event eventReadIr, eventReadDepth;
+
+    cl::Buffer * last_buffer = &buf_depth;
 
     CHECK_CL_RETURN(queue.enqueueWriteBuffer(buf_packet, CL_FALSE, 0, buf_packet_size, packet.buffer, NULL, &eventWrite[0]));
     CHECK_CL_RETURN(queue.enqueueNDRangeKernel(kernel_processPixelStage1, cl::NullRange, cl::NDRange(IMAGE_SIZE), cl::NullRange, &eventWrite, &eventPPS1[0]));
@@ -621,7 +649,18 @@ public:
 
     CHECK_CL_RETURN(queue.enqueueNDRangeKernel(kernel_filter_kde, cl::NullRange, cl::NDRange(IMAGE_SIZE), cl::NullRange, &eventPPS2, &eventFPS2[0]));
 
-    CHECK_CL_RETURN(queue.enqueueReadBuffer(buf_depth, CL_FALSE, 0, buf_depth_size, depth_frame->data, &eventFPS2, &eventReadDepth));
+    if (config.EnableIrShadowFilter)
+    {
+      CHECK_CL_RETURN(queue.enqueueNDRangeKernel(kernel_prepareIrShadowDiscard, cl::NullRange, cl::NDRange(424), cl::NullRange, &eventFPS2, &eventPrepShadow[0]));
+      CHECK_CL_RETURN(queue.enqueueNDRangeKernel(kernel_applyIrShadowDiscard, cl::NullRange, cl::NDRange(IMAGE_SIZE), cl::NullRange, &eventPrepShadow, &eventApplyShadow[0]));
+      last_buffer = &buf_ir_shadow_discarded;
+    }
+    else
+    {
+      eventApplyShadow[0] = eventFPS2[0];
+    }
+
+    CHECK_CL_RETURN(queue.enqueueReadBuffer(*last_buffer, CL_FALSE, 0, buf_depth_size, depth_frame->data, &eventApplyShadow, &eventReadDepth));
     CHECK_CL_RETURN(eventReadIr.wait());
     CHECK_CL_RETURN(eventReadDepth.wait());
 
@@ -660,7 +699,7 @@ public:
 
   bool readProgram(std::string &source) const
   {
-    source = loadCLKdeSource("opencl_kde_depth_packet_processor.cl");
+    source = loadCLKdeSource("opencl_kde_depth_packet_processor.cl") + loadCLKdeSource("opencl_depth_shadow_removal.cl");
     return !source.empty();
   }
 

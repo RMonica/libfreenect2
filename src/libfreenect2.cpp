@@ -605,7 +605,8 @@ Freenect2Device::Config::Config() :
   MinDepth(0.5f),
   MaxDepth(4.5f), //set to > 8000 for best performance when using the kde pipeline
   EnableBilateralFilter(true),
-  EnableEdgeAwareFilter(true) {}
+  EnableEdgeAwareFilter(true),
+  EnableIrShadowFilter(true) {}
 
 void Freenect2DeviceImpl::setConfiguration(const Freenect2Device::Config &config)
 {
